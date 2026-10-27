@@ -326,12 +326,17 @@ export function streamCodeBuddy(
           }
 
           // 3. Tool Calls
-          if (delta?.tool_calls && Array.isArray(delta.tool_calls)) {
+          const hasActualToolCalls =
+            Array.isArray(delta?.tool_calls) &&
+            delta.tool_calls.length > 0 &&
+            delta.tool_calls.some((tc) => tc.id || tc.function?.name || tc.function?.arguments);
+
+          if (hasActualToolCalls) {
             ensureStarted();
             closeThinkingIfActive();
             closeTextIfActive();
 
-            for (const tc of delta.tool_calls) {
+            for (const tc of delta!.tool_calls!) {
               const idx = tc.index ?? 0;
               const existing = accumulatedToolCalls.get(idx) || {
                 id: tc.id || `call_${idx + 1}`,
