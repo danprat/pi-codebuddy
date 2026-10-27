@@ -253,11 +253,11 @@ Setelah berpindah wilayah, jalankan `/login codebuddy` untuk menghubungkan akun 
 
 | Perintah | Contoh Pemakaian | Deskripsi |
 |---|---|---|
-| `/codebuddy.usage` | `/codebuddy.usage` | Melihat kuota paket langganan aktif, sisa kredit, visual *progress bar*, dan waktu reset kuota. |
-| `/codebuddy.models` | `/codebuddy.models` | Menampilkan tabel lengkap model yang tersedia beserta batas konteks dan dukungan reasoning. |
+| `/codebuddy.usage` | `/codebuddy.usage`<br>`/codebuddy.usage --all` | Melihat kuota aktif akun. Gunakan `--all` untuk melihat dasbor kuota seluruh akun terdaftar beserta total kredit gabungan. |
+| `/codebuddy.models` | `/codebuddy.models` | Menampilkan tabel lengkap model yang tersedia beserta batas konteks (hingga 1M) dan dukungan reasoning. |
 | `/codebuddy.region` | `/codebuddy.region intl`<br>`/codebuddy.region cn` | Melihat wilayah saat ini atau berganti antara gateway Internasional (`codebuddy.ai`) dan China (`copilot.tencent.com`). |
-| `/codebuddy.accounts` | `/codebuddy.accounts`<br>`/codebuddy.accounts switch 2`<br>`/codebuddy.accounts remove 2` | Melihat seluruh akun yang terhubung, berpindah akun aktif, atau menghapus akun lama. |
-| `/codebuddy.doctor` | `/codebuddy.doctor` | Menampilkan diagnostik koneksi, endpoint aktif, akun aktif, latensi respons terakhir, dan riwayat error. |
+| `/codebuddy.accounts` | `/codebuddy.accounts`<br>`/codebuddy.accounts switch 2`<br>`/codebuddy.accounts mode round-robin`<br>`/codebuddy.accounts add <token>`<br>`/codebuddy.accounts remove 2` | Mengelola kolam akun: melihat daftar akun terhubung, beralih akun aktif, mengubah strategi rotasi (`failover`, `round-robin`, `least-used`), menambah token manual, atau menghapus akun. |
+| `/codebuddy.doctor` | `/codebuddy.doctor`<br>`/codebuddy.doctor --fix` | Menampilkan diagnostik lengkap provider. Opsi `--fix` menjalankan self-healing untuk memverifikasi semua akun, memperbarui kredit, dan memilih akun paling sehat. |
 | `/codebuddy.refresh` | `/codebuddy.refresh` | Memverifikasi dan menyegarkan token aktif langsung ke server CodeBuddy. |
 
 ---
