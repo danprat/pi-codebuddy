@@ -132,4 +132,69 @@ describe("CodeBuddy Request Transformation", () => {
     expect(toolMsg.tool_call_id).toBe("call_123");
     expect(toolMsg.content).toBe("file contents hello world");
   });
+
+  it("bridges skills and project instructions to first user message", () => {
+    const context: Context = {
+      systemPrompt: "Always write code in Bun and follow project guidelines.",
+      messages: [
+        {
+          role: "system",
+          content: "<skill name=\"pdf-reader\">Extract text from PDF</skill>",
+          timestamp: Date.now(),
+        },
+        {
+          role: "user",
+          content: "Please read document.pdf",
+          timestamp: Date.now(),
+        },
+      ],
+    };
+
+    const body = buildCodeBuddyRequestBody(dummyModel, context);
+
+    // System prompt must remain strictly official
+    expect(body.messages[0]?.role).toBe("system");
+    expect(body.messages[0]?.content).toBe("You are CodeBuddy Code.");
+
+    // First user message must contain the bridged context
+    const firstUserMsg = body.messages[1]!;
+    expect(firstUserMsg.role).toBe("user");
+    const userBlockText = (firstUserMsg.content as any)[0].text;
+    expect(userBlockText).toContain("pdf-reader");
+    expect(userBlockText).toContain("Please read document.pdf");
+  });
+
+  it("sanitizes complex tool schema and strips unsupported keywords", () => {
+    const context: Context = {
+      messages: [{ role: "user", content: "Check db", timestamp: Date.now() }],
+      tools: [
+        {
+          name: "query_database",
+          description: "Run SQL query",
+          parameters: {
+            $schema: "http://json-schema.org/draft-07/schema#",
+            $id: "db_query",
+            type: "object",
+            properties: {
+              sql: { type: ["string", "null"] },
+              timeout: {
+                anyOf: [{ type: "number" }, { type: "null" }],
+              },
+            },
+          },
+        },
+      ],
+    };
+
+    const body = buildCodeBuddyRequestBody(dummyModel, context);
+
+    expect(body.tools).toBeDefined();
+    expect(body.tools?.length).toBe(1);
+    const params = body.tools?.[0]?.function.parameters as any;
+
+    expect(params.$schema).toBeUndefined();
+    expect(params.$id).toBeUndefined();
+    expect(params.properties.sql.type).toBe("string");
+    expect(params.properties.timeout.type).toBe("number");
+  });
 });

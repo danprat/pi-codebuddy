@@ -105,6 +105,24 @@ export function getRegionConfig(region?: CodeBuddyRegion): RegionConfig {
   return REGIONS[currentRegion];
 }
 
+let prewarmed = false;
+export function prewarmConnection(url?: string): void {
+  const targetUrl = url || getRegionConfig().baseUrl;
+  try {
+    const origin = new URL(targetUrl).origin;
+    fetch(`${origin}/v2/chat/completions`, {
+      method: "OPTIONS",
+      headers: { "User-Agent": getRegionConfig().userAgent },
+      signal: AbortSignal.timeout(3000),
+    }).catch(() => {
+      // pre-warm is best effort
+    });
+    prewarmed = true;
+  } catch {
+    // ignore
+  }
+}
+
 // Deterministic RFC-4122-v5-shaped UUID derived from a session key, mirroring
 // the official client's per-conversation id (uuid5 over the session key).
 export function stableUuidFrom(key: string): string {

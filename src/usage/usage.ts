@@ -1,5 +1,6 @@
 import { getRegionConfig, type CodeBuddyRegion } from "../client/config.js";
 import { parseResetTime } from "../utils/security.js";
+import { loadAccountStore, updateAccountCredits } from "../auth/accounts.js";
 
 export interface QuotaItem {
   name: string;
@@ -175,5 +176,71 @@ export async function fetchCodeBuddyUsage(
     region: regionConfig.region,
     quotas,
     rawAccountsCount: accounts.length,
+  };
+}
+
+export interface AccountUsageReport {
+  accountId: string;
+  email?: string;
+  active: boolean;
+  region: CodeBuddyRegion;
+  usage?: CodeBuddyUsageResult;
+  error?: string;
+}
+
+export interface MultiAccountUsageSummary {
+  accounts: AccountUsageReport[];
+  totalRemainingCredits: number;
+  totalAvailableCredits: number;
+  totalUsedCredits: number;
+}
+
+export async function fetchMultiAccountUsage(): Promise<MultiAccountUsageSummary> {
+  const store = loadAccountStore();
+  const accountsList = Object.values(store.accounts);
+
+  const reports: AccountUsageReport[] = [];
+  let totalRemaining = 0;
+  let totalAvailable = 0;
+  let totalUsed = 0;
+
+  await Promise.allSettled(
+    accountsList.map(async (acc) => {
+      try {
+        const usage = await fetchCodeBuddyUsage(acc.access, acc.region);
+        const accRemaining = usage.quotas.reduce((sum, q) => sum + q.remaining, 0);
+        const accTotal = usage.quotas.reduce((sum, q) => sum + q.total, 0);
+        const accUsed = usage.quotas.reduce((sum, q) => sum + q.used, 0);
+
+        updateAccountCredits(acc.accountId, accRemaining);
+
+        totalRemaining += accRemaining;
+        totalAvailable += accTotal;
+        totalUsed += accUsed;
+
+        reports.push({
+          accountId: acc.accountId,
+          email: acc.email,
+          active: acc.accountId === store.activeAccountId,
+          region: acc.region || "intl",
+          usage,
+        });
+      } catch (err) {
+        reports.push({
+          accountId: acc.accountId,
+          email: acc.email,
+          active: acc.accountId === store.activeAccountId,
+          region: acc.region || "intl",
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }),
+  );
+
+  return {
+    accounts: reports.sort((a, b) => (b.active ? 1 : 0) - (a.active ? 1 : 0)),
+    totalRemainingCredits: Math.round(totalRemaining * 100) / 100,
+    totalAvailableCredits: Math.round(totalAvailable * 100) / 100,
+    totalUsedCredits: Math.round(totalUsed * 100) / 100,
   };
 }

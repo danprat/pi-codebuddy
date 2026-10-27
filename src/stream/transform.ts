@@ -59,16 +59,108 @@ export interface CodeBuddyRequestBody {
   tool_choice?: "auto" | "none" | "required";
 }
 
+function sanitizeSchema(schema: unknown): unknown {
+  if (!schema || typeof schema !== "object") return schema;
+  if (Array.isArray(schema)) return schema.map(sanitizeSchema);
+
+  const obj = { ...(schema as Record<string, unknown>) };
+  delete obj.$schema;
+  delete obj.$id;
+  delete obj.$defs;
+  delete obj.definitions;
+
+  // If type is an array like ["string", "null"], take the non-null type
+  if (Array.isArray(obj.type)) {
+    const valid = obj.type.find((t) => t !== "null");
+    if (valid) obj.type = valid;
+  }
+
+  // Handle anyOf with null
+  if (Array.isArray(obj.anyOf) && obj.anyOf.length === 2) {
+    const nonNull = obj.anyOf.find((item: any) => item && typeof item === "object" && item.type !== "null");
+    if (nonNull && typeof nonNull === "object") {
+      delete obj.anyOf;
+      Object.assign(obj, sanitizeSchema(nonNull));
+    }
+  }
+
+  if (obj.properties && typeof obj.properties === "object" && !Array.isArray(obj.properties)) {
+    const props: Record<string, unknown> = {};
+    for (const [key, propVal] of Object.entries(obj.properties as Record<string, unknown>)) {
+      props[key] = sanitizeSchema(propVal);
+    }
+    obj.properties = props;
+  }
+
+  if (obj.items && typeof obj.items === "object") {
+    obj.items = sanitizeSchema(obj.items);
+  }
+
+  return obj;
+}
+
 function convertTools(tools?: Tool[]) {
   if (!tools || tools.length === 0) return undefined;
-  return tools.map((tool) => ({
+  const filtered = tools.filter((t) => t && typeof t.name === "string" && t.name.trim().length > 0);
+  if (filtered.length === 0) return undefined;
+
+  return filtered.map((tool) => ({
     type: "function" as const,
     function: {
       name: tool.name,
-      description: tool.description,
-      parameters: tool.parameters,
+      ...(tool.description ? { description: tool.description } : {}),
+      parameters: sanitizeSchema(tool.parameters || { type: "object", properties: {} }),
     },
   }));
+}
+
+const HARNESS_PATTERNS = [
+  /you are an? expert coding assistant operating inside pi-bolt[^.]*\./gi,
+  /you are claude code[^.]*\./gi,
+  /anthropic's official cli[^.]*\./gi,
+  /you are an? (?:ai )?(?:coding |code )?agent[^.]*\./gi,
+];
+
+function extractBridgeContext(messages: Context["messages"], basePrompt?: string): string | undefined {
+  const parts: string[] = [];
+
+  // Extract from system prompt if present
+  if (basePrompt && typeof basePrompt === "string" && basePrompt.trim()) {
+    let cleaned = basePrompt;
+    for (const pat of HARNESS_PATTERNS) {
+      cleaned = cleaned.replace(pat, "");
+    }
+    const trimmed = cleaned.trim();
+    if (trimmed.length > 0) {
+      parts.push(trimmed);
+    }
+  }
+
+  // Extract from system messages (e.g. skills, dynamically added rules)
+  for (const msg of messages || []) {
+    if ((msg.role as string) === "system") {
+      let contentStr = "";
+      if (typeof msg.content === "string") {
+        contentStr = msg.content;
+      } else if (Array.isArray(msg.content)) {
+        contentStr = msg.content
+          .map((b) => (typeof b === "string" ? b : (b as any)?.text || ""))
+          .join("\n");
+      }
+
+      let cleaned = contentStr;
+      for (const pat of HARNESS_PATTERNS) {
+        cleaned = cleaned.replace(pat, "");
+      }
+      const trimmed = cleaned.trim();
+      if (trimmed.length > 0) {
+        parts.push(trimmed);
+      }
+    }
+  }
+
+  if (parts.length === 0) return undefined;
+  return parts.join("\n\n");
 }
 
 export function buildCodeBuddyRequestBody(
@@ -92,6 +184,10 @@ export function buildCodeBuddyRequestBody(
     },
   ];
 
+  const systemPrompt = getCurrentSystemPrompt(context.messages) || context.systemPrompt;
+  const bridgeContext = extractBridgeContext(context.messages, systemPrompt);
+  let isFirstUser = true;
+
   for (const msg of context.messages) {
     if ((msg.role as string) === "system" || (msg.role as string) === "developer") {
       // Drop client system prompts to avoid tripping channel verification (code 11128)
@@ -99,19 +195,28 @@ export function buildCodeBuddyRequestBody(
     }
 
     if (msg.role === "user") {
+      const bridgeHeader = isFirstUser && bridgeContext ? `[Active Instructions & Context:\n${bridgeContext}\n]\n\n` : "";
+      isFirstUser = false;
+
       if (typeof msg.content === "string") {
         messages.push({
           role: "user",
-          content: [{ type: "text", text: msg.content }],
+          content: [{ type: "text", text: `${bridgeHeader}${msg.content}` }],
         });
       } else if (Array.isArray(msg.content)) {
         const parts: Array<{ type: string; text?: string; image_url?: { url: string } }> = [];
+        let hasAppendedBridge = false;
+
         for (const item of msg.content) {
           if (typeof item === "string") {
-            parts.push({ type: "text", text: item });
+            const text = !hasAppendedBridge && bridgeHeader ? `${bridgeHeader}${item}` : item;
+            hasAppendedBridge = true;
+            parts.push({ type: "text", text });
           } else if (item && typeof item === "object") {
             if (item.type === "text" && typeof (item as TextContent).text === "string") {
-              parts.push({ type: "text", text: (item as TextContent).text });
+              const text = !hasAppendedBridge && bridgeHeader ? `${bridgeHeader}${(item as TextContent).text}` : (item as TextContent).text;
+              hasAppendedBridge = true;
+              parts.push({ type: "text", text });
             } else if (item.type === "image") {
               const img = item as ImageContent;
               const rawData = img.data;
@@ -123,6 +228,11 @@ export function buildCodeBuddyRequestBody(
             }
           }
         }
+
+        if (bridgeHeader && !hasAppendedBridge) {
+          parts.unshift({ type: "text", text: bridgeHeader });
+        }
+
         messages.push({
           role: "user",
           content: parts.length > 0 ? parts : [{ type: "text", text: "" }],
@@ -178,7 +288,9 @@ export function buildCodeBuddyRequestBody(
     }
   }
 
-  const tools = convertTools(getCurrentTools(context.messages) || context.tools);
+  const currentTools = getCurrentTools(context.messages);
+  const rawTools = currentTools && currentTools.length > 0 ? currentTools : context.tools;
+  const tools = convertTools(rawTools);
 
   const body: CodeBuddyRequestBody = {
     model: model.id,

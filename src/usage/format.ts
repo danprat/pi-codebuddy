@@ -1,4 +1,4 @@
-import type { CodeBuddyUsageResult, QuotaItem } from "./usage.js";
+import type { CodeBuddyUsageResult, MultiAccountUsageSummary, QuotaItem } from "./usage.js";
 
 function renderProgressBar(percent: number, width = 16): string {
   const clamped = Math.max(0, Math.min(100, percent));
@@ -52,5 +52,51 @@ export function formatUsageSummary(usage: CodeBuddyUsageResult): string {
   }
 
   lines.push("Use /codebuddy.region to toggle between intl and cn.");
+  return lines.join("\n");
+}
+
+export function formatMultiAccountSummary(summary: MultiAccountUsageSummary, routingMode = "failover"): string {
+  const lines: string[] = [];
+  lines.push("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+  lines.push(`CodeBuddy Multi-Account Quota Pool (${summary.accounts.length} accounts)`);
+  lines.push(`Routing Strategy: ${routingMode.toUpperCase()}`);
+  lines.push("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+
+  if (summary.accounts.length === 0) {
+    lines.push("No linked accounts found. Run /login codebuddy to add one.");
+    lines.push("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    return lines.join("\n");
+  }
+
+  for (let i = 0; i < summary.accounts.length; i++) {
+    const acc = summary.accounts[i]!;
+    const marker = acc.active ? "* " : "  ";
+    const label = acc.email || acc.accountId;
+    lines.push(`${marker}${i + 1}. ${label} [${acc.region.toUpperCase()}]${acc.active ? " (Active)" : ""}`);
+
+    if (acc.error) {
+      lines.push(`   Status: ⚠️ Error (${acc.error.slice(0, 80)})`);
+      lines.push("");
+      continue;
+    }
+
+    if (!acc.usage || acc.usage.quotas.length === 0) {
+      lines.push("   Status: Connected (No quota packages found)");
+      lines.push("");
+      continue;
+    }
+
+    lines.push(`   Plan: ${acc.usage.plan}`);
+    for (const q of acc.usage.quotas) {
+      lines.push(`   • ${q.name}: ${q.used.toFixed(1)}/${q.total.toFixed(1)} ${renderProgressBar(q.percentUsed, 10)}`);
+      lines.push(`     Remaining: ${q.remaining.toFixed(2)} credits | ${q.recurring ? "Resets" : "Expires"} in: ${formatRelativeTime(q.resetAt)}`);
+    }
+    lines.push("");
+  }
+
+  lines.push("────────────────────────────────────────────────────");
+  lines.push(`TOTAL COMBINED POOL: ${summary.totalRemainingCredits.toFixed(2)} / ${summary.totalAvailableCredits.toFixed(2)} credits remaining`);
+  lines.push("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+
   return lines.join("\n");
 }

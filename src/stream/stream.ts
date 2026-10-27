@@ -10,7 +10,13 @@ import {
   type ToolCall,
 } from "@earendil-works/pi-ai";
 import { getRegionConfig, buildChatHeaders, PROVIDER_ID } from "../client/config.js";
-import { failoverToNextAccount, resolveApiKeyFromContext } from "../auth/accounts.js";
+import {
+  failoverToNextAccount,
+  getAccountForNextTurn,
+  markAccountCooldown,
+  markAccountRestricted,
+  resolveApiKeyFromContext,
+} from "../auth/accounts.js";
 import { setLastEndpoint, setLastLatencyMs, setLastError, setLastModel, setLastStatus } from "../diagnostics/diagnostics.js";
 import { buildCodeBuddyRequestBody, parseCodeBuddyError } from "./transform.js";
 import { redactSecrets } from "../utils/security.js";
@@ -92,7 +98,9 @@ export function streamCodeBuddy(
     try {
       let token = options?.apiKey;
       if (!token || token === PROVIDER_ID) {
-        token = await resolveApiKeyFromContext();
+        // Use smart routing (round-robin / least-used / failover) across healthy accounts
+        const routedAccount = await getAccountForNextTurn();
+        token = routedAccount?.access || (await resolveApiKeyFromContext());
       }
 
       if (!token) {
@@ -148,8 +156,14 @@ export function streamCodeBuddy(
           lastErrorText = await response.text();
           const parsed = parseCodeBuddyError(response.status, lastErrorText);
 
-          // If rate limited, quota exceeded, or account restricted, try failing over to another stored account
+          // If rate limited, quota exceeded, or account restricted, mark status and try failing over
           if (response.status === 429 || parsed.code === 6004 || parsed.code === 11140) {
+            if (parsed.code === 6004 && parsed.resetsAtMs) {
+              markAccountCooldown(token, parsed.resetsAtMs);
+            } else if (parsed.code === 11140) {
+              markAccountRestricted(token, parsed.message);
+            }
+
             const nextAccount = await failoverToNextAccount(triedTokens);
             if (nextAccount?.access) {
               triedTokens.add(nextAccount.access);
@@ -376,17 +390,23 @@ export function streamCodeBuddy(
         }
       };
 
+      let scanStart = 0;
       while (true) {
         const { value, done } = await reader.read();
         if (done) break;
         if (!value) continue;
 
         buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split("\n");
-        buffer = lines.pop() || "";
-
-        for (const line of lines) {
+        let newlineIdx: number;
+        while ((newlineIdx = buffer.indexOf("\n", scanStart)) !== -1) {
+          const line = buffer.slice(scanStart, newlineIdx);
+          scanStart = newlineIdx + 1;
           await processLine(line);
+        }
+
+        if (scanStart > 0) {
+          buffer = buffer.slice(scanStart);
+          scanStart = 0;
         }
       }
 

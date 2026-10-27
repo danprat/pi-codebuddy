@@ -10,16 +10,24 @@ const ACCOUNTS_FILE = "codebuddy-accounts.json";
 const AUTH_FILE = "auth.json";
 const REFRESH_SKEW_MS = 5 * 60 * 1000;
 
+export type AccountRoutingMode = "failover" | "round-robin" | "least-used";
+
 export interface StoredAccount extends CodeBuddyOAuthCredentials {
   accountId: string;
   addedAt: number;
   lastUsedAt: number;
   email?: string;
+  cooldownUntil?: number;
+  restricted?: boolean;
+  lastError?: string;
+  remainingCredits?: number;
 }
 
 interface AccountsFile {
   version: 1;
   activeAccountId?: string;
+  routingMode?: AccountRoutingMode;
+  roundRobinIndex?: number;
   accounts: Record<string, StoredAccount>;
 }
 
@@ -29,6 +37,9 @@ export interface AccountSummary {
   region?: CodeBuddyRegion;
   active: boolean;
   lastUsedAt: number;
+  cooldownUntil?: number;
+  restricted?: boolean;
+  remainingCredits?: number;
 }
 
 function agentDir(): string {
@@ -87,9 +98,16 @@ function normalizeStore(value: Record<string, unknown> | undefined): AccountsFil
     typeof value.activeAccountId === "string" && accounts[value.activeAccountId]
       ? value.activeAccountId
       : undefined;
+  const routingMode =
+    value.routingMode === "round-robin" || value.routingMode === "least-used"
+      ? value.routingMode
+      : "failover";
+  const roundRobinIndex = typeof value.roundRobinIndex === "number" ? value.roundRobinIndex : 0;
   return {
     version: 1,
     activeAccountId,
+    routingMode,
+    roundRobinIndex,
     accounts,
   };
 }
@@ -119,6 +137,10 @@ function accountFromCredentials(
     addedAt: existing?.addedAt || now,
     lastUsedAt: now,
     region: credentials.region || existing?.region || getActiveRegion(),
+    cooldownUntil: existing?.cooldownUntil,
+    restricted: existing?.restricted,
+    remainingCredits: existing?.remainingCredits,
+    lastError: existing?.lastError,
   };
 }
 
@@ -235,6 +257,74 @@ export function updateRememberedAccount(
   writeActiveCredential(account);
 }
 
+export function getRoutingMode(): AccountRoutingMode {
+  const store = loadAccountStore();
+  return store.routingMode || "failover";
+}
+
+export function setRoutingMode(mode: AccountRoutingMode): void {
+  const store = loadAccountStore();
+  store.routingMode = mode;
+  saveAccountStore(store);
+}
+
+export function markAccountCooldown(tokenOrId: string, resetsAtMs: number): void {
+  const store = loadAccountStore();
+  for (const account of Object.values(store.accounts)) {
+    if (account.accountId === tokenOrId || account.access === tokenOrId) {
+      account.cooldownUntil = resetsAtMs;
+      saveAccountStore(store);
+      break;
+    }
+  }
+}
+
+export function markAccountRestricted(tokenOrId: string, reason?: string): void {
+  const store = loadAccountStore();
+  for (const account of Object.values(store.accounts)) {
+    if (account.accountId === tokenOrId || account.access === tokenOrId) {
+      account.restricted = true;
+      account.lastError = reason || "Account restricted (11140)";
+      saveAccountStore(store);
+      break;
+    }
+  }
+}
+
+export function updateAccountCredits(accountId: string, credits: number): void {
+  const store = loadAccountStore();
+  if (store.accounts[accountId]) {
+    store.accounts[accountId]!.remainingCredits = credits;
+    saveAccountStore(store);
+  }
+}
+
+export function addAccountFromToken(
+  token: string,
+  options?: { refresh?: string; region?: CodeBuddyRegion },
+): StoredAccount {
+  let email: string | undefined;
+  try {
+    const parts = token.split(".");
+    if (parts[1]) {
+      const payload = JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8"));
+      email = payload.email || payload.preferred_username;
+    }
+  } catch {
+    // ignore
+  }
+
+  const credentials: CodeBuddyOAuthCredentials = {
+    access: token.trim(),
+    refresh: options?.refresh?.trim() || "",
+    expires: Date.now() + 86400 * 1000 - 5 * 60 * 1000,
+    region: options?.region || getActiveRegion(),
+    email,
+  };
+
+  return rememberAccount(credentials);
+}
+
 export function listAccounts(): AccountSummary[] {
   syncCurrentAuth();
   const store = loadAccountStore();
@@ -244,6 +334,9 @@ export function listAccounts(): AccountSummary[] {
     region: account.region,
     active: account.accountId === store.activeAccountId,
     lastUsedAt: account.lastUsedAt,
+    cooldownUntil: account.cooldownUntil,
+    restricted: account.restricted,
+    remainingCredits: account.remainingCredits,
   }));
 }
 
@@ -296,31 +389,83 @@ export async function removeAccount(selector: string): Promise<StoredAccount | u
 }
 
 /**
- * Failover to next available account when rate limited or quota exhausted (429 / 6004).
+ * Select the best account for the next chat turn based on the configured routingMode:
+ * - failover: use active account, fallback to next healthy account
+ * - round-robin: rotate across healthy accounts per turn
+ * - least-used: pick account with highest remaining credits / longest idle time
+ */
+export async function getAccountForNextTurn(
+  triedAccessTokens: ReadonlySet<string> = new Set(),
+): Promise<StoredAccount | undefined> {
+  syncCurrentAuth();
+  const store = loadAccountStore();
+  const now = Date.now();
+
+  // Healthy candidates: not restricted, not in active cooldown, not already tried
+  const candidates = sortedAccounts(store).filter((account) => {
+    if (triedAccessTokens.has(account.access)) return false;
+    if (account.restricted) return false;
+    if (account.cooldownUntil && account.cooldownUntil > now) return false;
+    return true;
+  });
+
+  if (candidates.length === 0) {
+    // If all healthy are exhausted but active account wasn't tried, check fallback
+    return undefined;
+  }
+
+  const mode = store.routingMode || "failover";
+  let selected: StoredAccount | undefined;
+
+  if (mode === "round-robin") {
+    let nextIdx = (store.roundRobinIndex ?? 0) % candidates.length;
+    selected = candidates[nextIdx];
+    store.roundRobinIndex = (nextIdx + 1) % candidates.length;
+    saveAccountStore(store);
+  } else if (mode === "least-used") {
+    // Sort by remainingCredits desc, then lastUsedAt asc
+    const sorted = [...candidates].sort((a, b) => {
+      const credA = a.remainingCredits ?? 0;
+      const credB = b.remainingCredits ?? 0;
+      if (credA !== credB) return credB - credA;
+      return a.lastUsedAt - b.lastUsedAt;
+    });
+    selected = sorted[0];
+  } else {
+    // Failover mode: use active account if healthy
+    const active = store.activeAccountId ? store.accounts[store.activeAccountId] : undefined;
+    if (active && !active.restricted && (!active.cooldownUntil || active.cooldownUntil <= now) && !triedAccessTokens.has(active.access)) {
+      selected = active;
+    } else {
+      selected = candidates[0];
+    }
+  }
+
+  if (selected) {
+    try {
+      const fresh = await ensureFresh(selected);
+      fresh.lastUsedAt = Date.now();
+      store.accounts[fresh.accountId] = fresh;
+      store.activeAccountId = fresh.accountId;
+      saveAccountStore(store);
+      writeActiveCredential(fresh);
+      return fresh;
+    } catch {
+      // If token refresh fails, try next candidate
+      return getAccountForNextTurn(new Set([...triedAccessTokens, selected.access]));
+    }
+  }
+
+  return undefined;
+}
+
+/**
+ * Failover to next available account when rate limited or quota exhausted (429 / 6004 / 11140).
  */
 export async function failoverToNextAccount(
   triedAccessTokens: ReadonlySet<string>,
 ): Promise<StoredAccount | undefined> {
-  syncCurrentAuth();
-  const store = loadAccountStore();
-  const candidates = sortedAccounts(store).filter(
-    (account) => !triedAccessTokens.has(account.access),
-  );
-  for (const candidate of candidates) {
-    try {
-      const account = await ensureFresh(candidate);
-      if (!account.access || triedAccessTokens.has(account.access)) continue;
-      account.lastUsedAt = Date.now();
-      store.accounts[account.accountId] = account;
-      store.activeAccountId = account.accountId;
-      saveAccountStore(store);
-      writeActiveCredential(account);
-      return account;
-    } catch {
-      // Skip invalid accounts
-    }
-  }
-  return undefined;
+  return getAccountForNextTurn(triedAccessTokens);
 }
 
 export async function resolveApiKeyFromContext(ctx?: ExtensionCommandContext): Promise<string | undefined> {

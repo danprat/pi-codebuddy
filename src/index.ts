@@ -1,18 +1,27 @@
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import {
   activateAccount,
+  addAccountFromToken,
+  ensureFresh,
+  getRoutingMode,
   listAccounts,
+  loadAccountStore,
   loginCodeBuddy,
+  markAccountRestricted,
   refreshCodeBuddyToken,
   rememberAccount,
   removeAccount,
   resolveApiKeyFromContext,
+  setRoutingMode,
+  updateAccountCredits,
   updateRememberedAccount,
   getApiKey,
+  type AccountRoutingMode,
 } from "./auth/index.js";
 import {
   getActiveRegion,
   getRegionConfig,
+  prewarmConnection,
   PROVIDER_ID,
   PROVIDER_NAME,
   setActiveRegion,
@@ -21,7 +30,12 @@ import {
 import { getLastDiagnostics, runWithDiagnostics } from "./diagnostics/index.js";
 import { getModelCatalog } from "./models/index.js";
 import { streamCodeBuddy } from "./stream/index.js";
-import { fetchCodeBuddyUsage, formatUsageSummary } from "./usage/index.js";
+import {
+  fetchCodeBuddyUsage,
+  fetchMultiAccountUsage,
+  formatMultiAccountSummary,
+  formatUsageSummary,
+} from "./usage/index.js";
 import { maskEmail, redactSecrets } from "./utils/index.js";
 
 function emitCommandOutput(
@@ -60,6 +74,25 @@ export default function (pi: ExtensionAPI): void {
   const initialRegionConfig = getRegionConfig();
   const models = getModelCatalog();
 
+  // Pre-warm connection and check token freshness in background on session start
+  pi.on("session_start", async () => {
+    prewarmConnection(initialRegionConfig.baseUrl);
+
+    // Background pre-emptive token refresh
+    try {
+      const store = loadAccountStore();
+      if (store.activeAccountId && store.accounts[store.activeAccountId]) {
+        const active = store.accounts[store.activeAccountId]!;
+        // If token expires in less than 10 minutes, refresh proactively
+        if (active.refresh && active.expires < Date.now() + 10 * 60 * 1000) {
+          void ensureFresh(active).catch(() => {});
+        }
+      }
+    } catch {
+      // ignore
+    }
+  });
+
   const providerConfig = {
     name: PROVIDER_NAME,
     baseUrl: initialRegionConfig.baseUrl,
@@ -91,9 +124,18 @@ export default function (pi: ExtensionAPI): void {
 
   // 1. /codebuddy.usage
   pi.registerCommand("codebuddy.usage", {
-    description: "Show CodeBuddy quota allowances (refill cycles and bonus packages)",
-    handler: async (_args, ctx) => {
+    description: "Show CodeBuddy quota allowances: /codebuddy.usage [--all]",
+    handler: async (args, ctx) => {
+      const isAll = Boolean(args && /--all|\ball\b/i.test(args));
+
       try {
+        if (isAll) {
+          if (ctx.hasUI) ctx.ui.notify("Fetching quota for all linked accounts...", "info");
+          const multi = await runWithDiagnostics(() => fetchMultiAccountUsage());
+          emitCommandOutput(ctx, formatMultiAccountSummary(multi, getRoutingMode()));
+          return;
+        }
+
         const token = await resolveApiKeyFromContext(ctx);
         if (!token) {
           emitCommandOutput(
@@ -106,7 +148,7 @@ export default function (pi: ExtensionAPI): void {
 
         if (ctx.hasUI) ctx.ui.notify("Fetching CodeBuddy quota...", "info");
         const usage = await runWithDiagnostics(() => fetchCodeBuddyUsage(token));
-        emitCommandOutput(ctx, formatUsageSummary(usage));
+        emitCommandOutput(ctx, `${formatUsageSummary(usage)}\n(Tip: use /codebuddy.usage --all to see all accounts)`);
       } catch (error) {
         const msg = error instanceof Error ? error.message : String(error);
         emitCommandOutput(ctx, `CodeBuddy usage query failed: ${msg}`, "error");
@@ -148,6 +190,7 @@ export default function (pi: ExtensionAPI): void {
       if (target === "intl" || target === "cn") {
         setActiveRegion(target as CodeBuddyRegion);
         const config = getRegionConfig(target as CodeBuddyRegion);
+        prewarmConnection(config.baseUrl);
         emitCommandOutput(
           ctx,
           `Active CodeBuddy region switched to: ${config.name} (${target.toUpperCase()})\nEndpoint: ${config.baseUrl}`,
@@ -167,10 +210,32 @@ export default function (pi: ExtensionAPI): void {
 
   // 4. /codebuddy.accounts
   pi.registerCommand("codebuddy.accounts", {
-    description: "List, switch, or remove linked CodeBuddy accounts",
+    description: "Manage CodeBuddy accounts: switch, remove, add, mode [failover|round-robin|least-used]",
     handler: async (args, ctx) => {
       const command = (args || "").trim();
       try {
+        if (command.startsWith("mode ")) {
+          const modeInput = command.slice("mode ".length).trim().toLowerCase() as AccountRoutingMode;
+          if (["failover", "round-robin", "least-used"].includes(modeInput)) {
+            setRoutingMode(modeInput);
+            emitCommandOutput(ctx, `Multi-account routing strategy set to: ${modeInput.toUpperCase()}`, "info");
+            return;
+          }
+          emitCommandOutput(ctx, "Usage: /codebuddy.accounts mode [failover | round-robin | least-used]", "warning");
+          return;
+        }
+
+        if (command.startsWith("add ")) {
+          const rawToken = command.slice("add ".length).trim();
+          if (!rawToken) {
+            emitCommandOutput(ctx, "Usage: /codebuddy.accounts add <access_token>", "warning");
+            return;
+          }
+          const account = addAccountFromToken(rawToken);
+          emitCommandOutput(ctx, `Added account: ${account.email || account.accountId} (Active)`, "info");
+          return;
+        }
+
         if (command.startsWith("switch ")) {
           const selector = command.slice("switch ".length).trim();
           const account = await activateAccount(selector);
@@ -193,6 +258,7 @@ export default function (pi: ExtensionAPI): void {
         }
 
         const accounts = listAccounts();
+        const currentMode = getRoutingMode();
         if (accounts.length === 0) {
           emitCommandOutput(
             ctx,
@@ -203,7 +269,7 @@ export default function (pi: ExtensionAPI): void {
         }
 
         const lines = [
-          "Linked CodeBuddy Accounts:",
+          `Linked CodeBuddy Accounts (Mode: ${currentMode.toUpperCase()}):`,
           "───────────────────────────────────────────────────────",
         ];
 
@@ -211,11 +277,25 @@ export default function (pi: ExtensionAPI): void {
           const marker = acc.active ? "* " : "  ";
           const emailOrId = acc.email ? maskEmail(acc.email) : acc.accountId;
           const reg = acc.region ? ` [${acc.region.toUpperCase()}]` : "";
-          lines.push(`${marker}${i + 1}. ${emailOrId}${reg}`);
+          let statusExtra = "";
+          if (acc.restricted) {
+            statusExtra = " ⛔ [RESTRICTED 11140]";
+          } else if (acc.cooldownUntil && acc.cooldownUntil > Date.now()) {
+            const secs = Math.ceil((acc.cooldownUntil - Date.now()) / 1000);
+            statusExtra = ` ⏳ [COOLDOWN ${secs}s]`;
+          } else if (acc.remainingCredits !== undefined) {
+            statusExtra = ` (${acc.remainingCredits.toFixed(1)} credits)`;
+          }
+
+          lines.push(`${marker}${i + 1}. ${emailOrId}${reg}${statusExtra}`);
         });
 
         lines.push("───────────────────────────────────────────────────────");
-        lines.push("Commands: /codebuddy.accounts switch <index|id> or remove <index|id>");
+        lines.push("Commands:");
+        lines.push("  /codebuddy.accounts switch <index|id>");
+        lines.push("  /codebuddy.accounts mode [failover | round-robin | least-used]");
+        lines.push("  /codebuddy.accounts add <token>");
+        lines.push("  /codebuddy.accounts remove <index|id>");
         emitCommandOutput(ctx, lines.join("\n"));
       } catch (error) {
         const msg = error instanceof Error ? error.message : String(error);
@@ -226,14 +306,48 @@ export default function (pi: ExtensionAPI): void {
 
   // 5. /codebuddy.doctor
   pi.registerCommand("codebuddy.doctor", {
-    description: "Check CodeBuddy diagnostics, connection status, and active region",
-    handler: async (_args, ctx) => {
+    description: "Check CodeBuddy diagnostics: /codebuddy.doctor [--fix]",
+    handler: async (args, ctx) => {
+      const isFix = Boolean(args && /--fix|\bfix\b/i.test(args));
+
+      if (isFix) {
+        if (ctx.hasUI) ctx.ui.notify("Running self-healing account check...", "info");
+        const store = loadAccountStore();
+        const results: string[] = ["CodeBuddy Self-Healing Doctor Results:"];
+        let healed = 0;
+
+        for (const acc of Object.values(store.accounts)) {
+          const label = acc.email || acc.accountId;
+          try {
+            const fresh = await ensureFresh(acc);
+            const usage = await fetchCodeBuddyUsage(fresh.access, fresh.region);
+            const remaining = usage.quotas.reduce((s, q) => s + q.remaining, 0);
+            updateAccountCredits(acc.accountId, remaining);
+            results.push(`✓ ${label}: Healthy (${remaining.toFixed(1)} credits remaining)`);
+            healed++;
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            if (msg.includes("11140") || msg.includes("unusual activity")) {
+              markAccountRestricted(acc.accountId, msg);
+              results.push(`⛔ ${label}: Flagged restricted (11140)`);
+            } else {
+              results.push(`⚠️ ${label}: ${msg.slice(0, 60)}`);
+            }
+          }
+        }
+
+        results.push(`Summary: ${healed} healthy accounts ready in the pool.`);
+        emitCommandOutput(ctx, results.join("\n"), "info");
+        return;
+      }
+
       const d = getLastDiagnostics();
       const currentRegion = getActiveRegion();
       const regionConfig = getRegionConfig(currentRegion);
       const accounts = listAccounts();
       const active = accounts.find((a) => a.active);
       const activeLabel = active ? (active.email ? maskEmail(active.email) : active.accountId) : "none";
+      const routingMode = getRoutingMode();
 
       const lines = [
         "CodeBuddy Doctor Diagnostics",
@@ -243,12 +357,13 @@ export default function (pi: ExtensionAPI): void {
         `endpoint=${d.lastEndpoint || regionConfig.baseUrl}`,
         `activeAccount=${activeLabel}`,
         `linkedAccounts=${accounts.length}`,
+        `routingMode=${routingMode.toUpperCase()}`,
         `lastModel=${d.lastModel || "none"}`,
         `lastStatus=${d.lastStatus ?? "none"}`,
         `lastLatencyMs=${d.lastLatencyMs !== undefined ? `${d.lastLatencyMs}ms` : "none"}`,
         `lastError=${d.lastError ? redactSecrets(d.lastError) : "none"}`,
         "transport=custom-streamSimple (OpenAI SSE + typed blocks)",
-        "commands=/codebuddy.usage /codebuddy.models /codebuddy.region /codebuddy.accounts /codebuddy.doctor",
+        "tip=Run /codebuddy.doctor --fix to test and heal all accounts",
         "───────────────────────────────────────────────────────",
       ];
 
