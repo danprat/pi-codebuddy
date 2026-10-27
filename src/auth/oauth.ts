@@ -153,11 +153,22 @@ export async function loginCodeBuddy(
 
     if (result.ok && result.data) {
       const expiresIn = result.data.expiresIn || 86400;
+      let email: string | undefined;
+      try {
+        const parts = result.data.accessToken.split(".");
+        if (parts[1]) {
+          const payload = JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8"));
+          email = payload.email || payload.preferred_username;
+        }
+      } catch {
+        // ignore JWT parse error
+      }
       return {
         access: result.data.accessToken,
         refresh: result.data.refreshToken || "",
         expires: Date.now() + expiresIn * 1000 - 5 * 60 * 1000,
         region,
+        email,
       };
     }
     if (!result.pending && result.error) {

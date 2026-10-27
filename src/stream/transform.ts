@@ -236,6 +236,18 @@ export function parseCodeBuddyError(status: number, bodyText: string): ParsedCod
       code = data?.code;
       msg = data?.msg || data?.message || data?.error?.message || bodyText.slice(0, 300);
 
+      // Check code 11140 account restriction error (Tencent risk-control)
+      if (code === 11140 || /unusual activity|已被限制使用|异常使用行为|restricted due to unusual activity/i.test(msg)) {
+        const tip = data?.displayTips?.en || data?.displayTips?.zh || data?.displayMsg?.en;
+        return {
+          status: 403,
+          code: 11140,
+          message: `CodeBuddy account restricted (11140): ${tip || "We detected unusual activity on this account. Submit feedback to appeal this restriction."} Please run /login codebuddy with another account or appeal on https://www.codebuddy.ai.`,
+          resetsAtMs: null,
+          resetsAtIso: null,
+        };
+      }
+
       // Check code 11128 channel verification error
       if (code === 11128 || /request illegal|channel verification|渠道校验/i.test(msg)) {
         const tip = data?.displayTips?.en || data?.displayTips?.zh || data?.displayMsg?.en;

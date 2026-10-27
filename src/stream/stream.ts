@@ -148,8 +148,8 @@ export function streamCodeBuddy(
           lastErrorText = await response.text();
           const parsed = parseCodeBuddyError(response.status, lastErrorText);
 
-          // If rate limited or quota exceeded, try failing over to another stored account
-          if (response.status === 429 || parsed.code === 6004) {
+          // If rate limited, quota exceeded, or account restricted, try failing over to another stored account
+          if (response.status === 429 || parsed.code === 6004 || parsed.code === 11140) {
             const nextAccount = await failoverToNextAccount(triedTokens);
             if (nextAccount?.access) {
               triedTokens.add(nextAccount.access);

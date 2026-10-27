@@ -29,6 +29,21 @@ describe("CodeBuddy Error & Rate Limit Parsing", () => {
     expect(parsed.resetsAtMs).toBeNumber();
   });
 
+  it("parses code 11140 account restriction error with actionable guidance", () => {
+    const errorJson = JSON.stringify({
+      code: 11140,
+      msg: "request illegal",
+      displayMsg: { en: "Your account has been restricted due to unusual activity" },
+      displayTips: { en: "We detected unusual activity on this account. Submit feedback to appeal this restriction" },
+    });
+
+    const parsed = parseCodeBuddyError(403, errorJson);
+    expect(parsed.status).toBe(403);
+    expect(parsed.code).toBe(11140);
+    expect(parsed.message).toContain("11140");
+    expect(parsed.message).toContain("unusual activity");
+  });
+
   it("redacts bearer tokens and secrets from error strings", () => {
     const raw = "Request failed for Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.secret123 with key sk-abcdef123456789012345678";
     const redacted = redactSecrets(raw);
