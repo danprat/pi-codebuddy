@@ -1,0 +1,42 @@
+{
+  "name": "pi-codebuddy",
+  "version": "0.1.0",
+  "description": "CodeBuddy AI provider plugin for Pi Coding Agent",
+  "author": "CodeBuddy Pi Plugin Contributor",
+  "license": "MIT",
+  "type": "module",
+  "main": "./src/index.ts",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "codebuddy",
+    "tencent",
+    "ai",
+    "provider",
+    "oauth"
+  ],
+  "files": [
+    "LICENSE",
+    "README.md",
+    "src",
+    "tsconfig.json"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "bun test"
+  },
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.4.4",
+    "@types/node": "^22.13.0",
+    "typescript": "^5.7.3"
+  }
+}
